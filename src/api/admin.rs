@@ -25,8 +25,6 @@ use crate::{
     CONFIG, VERSION,
 };
 
-use futures::{stream, stream::StreamExt};
-
 pub fn routes() -> Vec<Route> {
     if !CONFIG.disable_admin_token() && !CONFIG.is_admin_token_set() {
         return routes![admin_disabled];
@@ -255,7 +253,7 @@ struct InviteData {
     email: String,
 }
 
-async fn get_user_or_404(uuid: &str, conn: &DbConn) -> ApiResult<User> {
+async fn get_user_or_404(uuid: &str, conn: &mut DbConn) -> ApiResult<User> {
     if let Some(user) = User::find_by_uuid(uuid, conn).await {
         Ok(user)
     } else {
@@ -264,16 +262,16 @@ async fn get_user_or_404(uuid: &str, conn: &DbConn) -> ApiResult<User> {
 }
 
 #[post("/invite", data = "<data>")]
-async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -> JsonResult {
+async fn invite_user(data: Json<InviteData>, _token: AdminToken, mut conn: DbConn) -> JsonResult {
     let data: InviteData = data.into_inner();
     let email = data.email.clone();
-    if User::find_by_mail(&data.email, &conn).await.is_some() {
+    if User::find_by_mail(&data.email, &mut conn).await.is_some() {
         err_code!("User already exists", Status::Conflict.code)
     }
 
     let mut user = User::new(email);
 
-    async fn _generate_invite(user: &User, conn: &DbConn) -> EmptyResult {
+    async fn _generate_invite(user: &User, conn: &mut DbConn) -> EmptyResult {
         if CONFIG.mail_enabled() {
             mail::send_invite(&user.email, &user.uuid, None, None, &CONFIG.invitation_org_name(), None)
         } else {
@@ -282,10 +280,10 @@ async fn invite_user(data: Json<InviteData>, _token: AdminToken, conn: DbConn) -
         }
     }
 
-    _generate_invite(&user, &conn).await.map_err(|e| e.with_code(Status::InternalServerError.code))?;
-    user.save(&conn).await.map_err(|e| e.with_code(Status::InternalServerError.code))?;
+    _generate_invite(&user, &mut conn).await.map_err(|e| e.with_code(Status::InternalServerError.code))?;
+    user.save(&mut conn).await.map_err(|e| e.with_code(Status::InternalServerError.code))?;
 
-    Ok(Json(user.to_json(&conn).await))
+    Ok(Json(user.to_json(&mut conn).await))
 }
 
 #[post("/test/smtp", data = "<data>")]
@@ -306,90 +304,84 @@ fn logout(cookies: &CookieJar<'_>, referer: Referer) -> Redirect {
 }
 
 #[get("/users")]
-async fn get_users_json(_token: AdminToken, conn: DbConn) -> Json<Value> {
-    let users_json = stream::iter(User::get_all(&conn).await)
-        .then(|u| async {
-            let u = u; // Move out this single variable
-            u.to_json(&conn).await
-        })
-        .collect::<Vec<Value>>()
-        .await;
+async fn get_users_json(_token: AdminToken, mut conn: DbConn) -> Json<Value> {
+    let mut users_json = Vec::new();
+    for u in User::get_all(&mut conn).await {
+        users_json.push(u.to_json(&mut conn).await);
+    }
 
     Json(Value::Array(users_json))
 }
 
 #[get("/users/overview")]
-async fn users_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
+async fn users_overview(_token: AdminToken, mut conn: DbConn) -> ApiResult<Html<String>> {
     const DT_FMT: &str = "%Y-%m-%d %H:%M:%S %Z";
 
-    let users_json = stream::iter(User::get_all(&conn).await)
-        .then(|u| async {
-            let u = u; // Move out this single variable
-            let mut usr = u.to_json(&conn).await;
-            usr["cipher_count"] = json!(Cipher::count_owned_by_user(&u.uuid, &conn).await);
-            usr["attachment_count"] = json!(Attachment::count_by_user(&u.uuid, &conn).await);
-            usr["attachment_size"] = json!(get_display_size(Attachment::size_by_user(&u.uuid, &conn).await as i32));
-            usr["user_enabled"] = json!(u.enabled);
-            usr["created_at"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
-            usr["last_active"] = match u.last_active(&conn).await {
-                Some(dt) => json!(format_naive_datetime_local(&dt, DT_FMT)),
-                None => json!("Never"),
-            };
-            usr
-        })
-        .collect::<Vec<Value>>()
-        .await;
+    let mut users_json = Vec::new();
+    for u in User::get_all(&mut conn).await {
+        let mut usr = u.to_json(&mut conn).await;
+        usr["cipher_count"] = json!(Cipher::count_owned_by_user(&u.uuid, &mut conn).await);
+        usr["attachment_count"] = json!(Attachment::count_by_user(&u.uuid, &mut conn).await);
+        usr["attachment_size"] = json!(get_display_size(Attachment::size_by_user(&u.uuid, &mut conn).await as i32));
+        usr["user_enabled"] = json!(u.enabled);
+        usr["created_at"] = json!(format_naive_datetime_local(&u.created_at, DT_FMT));
+        usr["last_active"] = match u.last_active(&mut conn).await {
+            Some(dt) => json!(format_naive_datetime_local(&dt, DT_FMT)),
+            None => json!("Never"),
+        };
+        users_json.push(usr);
+    }
 
     let text = AdminTemplateData::with_data("admin/users", json!(users_json)).render()?;
     Ok(Html(text))
 }
 
 #[get("/users/<uuid>")]
-async fn get_user_json(uuid: String, _token: AdminToken, conn: DbConn) -> JsonResult {
-    let user = get_user_or_404(&uuid, &conn).await?;
+async fn get_user_json(uuid: String, _token: AdminToken, mut conn: DbConn) -> JsonResult {
+    let user = get_user_or_404(&uuid, &mut conn).await?;
 
-    Ok(Json(user.to_json(&conn).await))
+    Ok(Json(user.to_json(&mut conn).await))
 }
 
 #[post("/users/<uuid>/delete")]
-async fn delete_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let user = get_user_or_404(&uuid, &conn).await?;
-    user.delete(&conn).await
+async fn delete_user(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let user = get_user_or_404(&uuid, &mut conn).await?;
+    user.delete(&mut conn).await
 }
 
 #[post("/users/<uuid>/deauth")]
-async fn deauth_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = get_user_or_404(&uuid, &conn).await?;
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+async fn deauth_user(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let mut user = get_user_or_404(&uuid, &mut conn).await?;
+    Device::delete_all_by_user(&user.uuid, &mut conn).await?;
     user.reset_security_stamp();
 
-    user.save(&conn).await
+    user.save(&mut conn).await
 }
 
 #[post("/users/<uuid>/disable")]
-async fn disable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = get_user_or_404(&uuid, &conn).await?;
-    Device::delete_all_by_user(&user.uuid, &conn).await?;
+async fn disable_user(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let mut user = get_user_or_404(&uuid, &mut conn).await?;
+    Device::delete_all_by_user(&user.uuid, &mut conn).await?;
     user.reset_security_stamp();
     user.enabled = false;
 
-    user.save(&conn).await
+    user.save(&mut conn).await
 }
 
 #[post("/users/<uuid>/enable")]
-async fn enable_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = get_user_or_404(&uuid, &conn).await?;
+async fn enable_user(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let mut user = get_user_or_404(&uuid, &mut conn).await?;
     user.enabled = true;
 
-    user.save(&conn).await
+    user.save(&mut conn).await
 }
 
 #[post("/users/<uuid>/remove-2fa")]
-async fn remove_2fa(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let mut user = get_user_or_404(&uuid, &conn).await?;
-    TwoFactor::delete_all_by_user(&user.uuid, &conn).await?;
+async fn remove_2fa(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let mut user = get_user_or_404(&uuid, &mut conn).await?;
+    TwoFactor::delete_all_by_user(&user.uuid, &mut conn).await?;
     user.totp_recover = None;
-    user.save(&conn).await
+    user.save(&mut conn).await
 }
 
 #[derive(Deserialize, Debug)]
@@ -400,13 +392,14 @@ struct UserOrgTypeData {
 }
 
 #[post("/users/org_type", data = "<data>")]
-async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, conn: DbConn) -> EmptyResult {
+async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
     let data: UserOrgTypeData = data.into_inner();
 
-    let mut user_to_edit = match UserOrganization::find_by_user_and_org(&data.user_uuid, &data.org_uuid, &conn).await {
-        Some(user) => user,
-        None => err!("The specified user isn't member of the organization"),
-    };
+    let mut user_to_edit =
+        match UserOrganization::find_by_user_and_org(&data.user_uuid, &data.org_uuid, &mut conn).await {
+            Some(user) => user,
+            None => err!("The specified user isn't member of the organization"),
+        };
 
     let new_type = match UserOrgType::from_str(&data.user_type.into_string()) {
         Some(new_type) => new_type as i32,
@@ -416,7 +409,7 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, c
     if user_to_edit.atype == UserOrgType::Owner && new_type != UserOrgType::Owner {
         // Removing owner permmission, check that there are at least another owner
         let num_owners =
-            UserOrganization::find_by_org_and_type(&data.org_uuid, UserOrgType::Owner as i32, &conn).await.len();
+            UserOrganization::find_by_org_and_type(&data.org_uuid, UserOrgType::Owner as i32, &mut conn).await.len();
 
         if num_owners <= 1 {
             err!("Can't change the type of the last owner")
@@ -424,37 +417,34 @@ async fn update_user_org_type(data: Json<UserOrgTypeData>, _token: AdminToken, c
     }
 
     user_to_edit.atype = new_type as i32;
-    user_to_edit.save(&conn).await
+    user_to_edit.save(&mut conn).await
 }
 
 #[post("/users/update_revision")]
-async fn update_revision_users(_token: AdminToken, conn: DbConn) -> EmptyResult {
-    User::update_all_revisions(&conn).await
+async fn update_revision_users(_token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    User::update_all_revisions(&mut conn).await
 }
 
 #[get("/organizations/overview")]
-async fn organizations_overview(_token: AdminToken, conn: DbConn) -> ApiResult<Html<String>> {
-    let organizations_json = stream::iter(Organization::get_all(&conn).await)
-        .then(|o| async {
-            let o = o; //Move out this single variable
-            let mut org = o.to_json();
-            org["user_count"] = json!(UserOrganization::count_by_org(&o.uuid, &conn).await);
-            org["cipher_count"] = json!(Cipher::count_by_org(&o.uuid, &conn).await);
-            org["attachment_count"] = json!(Attachment::count_by_org(&o.uuid, &conn).await);
-            org["attachment_size"] = json!(get_display_size(Attachment::size_by_org(&o.uuid, &conn).await as i32));
-            org
-        })
-        .collect::<Vec<Value>>()
-        .await;
+async fn organizations_overview(_token: AdminToken, mut conn: DbConn) -> ApiResult<Html<String>> {
+    let mut organizations_json = Vec::new();
+    for o in Organization::get_all(&mut conn).await {
+        let mut org = o.to_json();
+        org["user_count"] = json!(UserOrganization::count_by_org(&o.uuid, &mut conn).await);
+        org["cipher_count"] = json!(Cipher::count_by_org(&o.uuid, &mut conn).await);
+        org["attachment_count"] = json!(Attachment::count_by_org(&o.uuid, &mut conn).await);
+        org["attachment_size"] = json!(get_display_size(Attachment::size_by_org(&o.uuid, &mut conn).await as i32));
+        organizations_json.push(org);
+    }
 
     let text = AdminTemplateData::with_data("admin/organizations", json!(organizations_json)).render()?;
     Ok(Html(text))
 }
 
 #[post("/organizations/<uuid>/delete")]
-async fn delete_organization(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
-    let org = Organization::find_by_uuid(&uuid, &conn).await.map_res("Organization doesn't exist")?;
-    org.delete(&conn).await
+async fn delete_organization(uuid: String, _token: AdminToken, mut conn: DbConn) -> EmptyResult {
+    let org = Organization::find_by_uuid(&uuid, &mut conn).await.map_res("Organization doesn't exist")?;
+    org.delete(&mut conn).await
 }
 
 #[derive(Deserialize)]
@@ -488,7 +478,7 @@ async fn has_http_access() -> bool {
 }
 
 #[get("/diagnostics")]
-async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> ApiResult<Html<String>> {
+async fn diagnostics(_token: AdminToken, ip_header: IpHeader, mut conn: DbConn) -> ApiResult<Html<String>> {
     use crate::util::read_file_string;
     use chrono::prelude::*;
     use std::net::ToSocketAddrs;
@@ -577,7 +567,7 @@ async fn diagnostics(_token: AdminToken, ip_header: IpHeader, conn: DbConn) -> A
         "ip_header_config": &CONFIG.ip_header(),
         "uses_proxy": uses_proxy,
         "db_type": *DB_TYPE,
-        "db_version": get_sql_server_version(&conn).await,
+        "db_version": get_sql_server_version(&mut conn).await,
         "admin_url": format!("{}/diagnostics", admin_url(Referer(None))),
         "overrides": &CONFIG.get_overrides().join(", "),
         "server_time_local": Local::now().format("%Y-%m-%d %H:%M:%S %Z").to_string(),
@@ -606,9 +596,9 @@ fn delete_config(_token: AdminToken) -> EmptyResult {
 }
 
 #[post("/config/backup_db")]
-async fn backup_db(_token: AdminToken, conn: DbConn) -> EmptyResult {
+async fn backup_db(_token: AdminToken, mut conn: DbConn) -> EmptyResult {
     if *CAN_BACKUP {
-        backup_database(&conn).await
+        backup_database(&mut conn).await
     } else {
         err!("Can't back up current DB (Only SQLite supports this feature)");
     }
